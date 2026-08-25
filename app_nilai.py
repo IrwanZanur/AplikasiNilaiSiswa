@@ -1,6 +1,6 @@
 import base64
 import io
-import mysql.connector
+import sqlite3
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -22,7 +22,7 @@ from reportlab.platypus import (
 )
 
 # ==============================================================================
-# 1. KONFIGURASI HALAMAN & DATABASE MYSQL
+# 1. KONFIGURASI HALAMAN & DATABASE SQLITE
 # ==============================================================================
 st.set_page_config(
     page_title="Sistem Pengolahan Nilai Siswa",
@@ -31,31 +31,85 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",
-    "password": "",  # Sesuaikan jika MySQL Anda menggunakan password
-    "database": "db_nilai_siswa",
-    "port": 3306,
-}
+DB_NAME = "data_nilai.db"
 
 
-@st.cache_resource
-def get_db_connection():
-  return mysql.connector.connect(**DB_CONFIG)
+def init_db():
+  """Inisialisasi tabel SQLite dan data dummy jika database belum ada."""
+  conn = sqlite3.connect(DB_NAME)
+  cursor = conn.cursor()
+
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kelas (
+            id_kelas INTEGER PRIMARY KEY AUTOINCREMENT,
+            nama_kelas TEXT NOT NULL
+        )
+    """)
+
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS siswa (
+            nis TEXT PRIMARY KEY,
+            nisn TEXT,
+            nama_siswa TEXT NOT NULL,
+            jenis_kelamin TEXT,
+            ttl TEXT,
+            id_kelas INTEGER,
+            FOREIGN KEY (id_kelas) REFERENCES kelas (id_kelas)
+        )
+    """)
+
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mata_pelajaran (
+            id_mapel INTEGER PRIMARY KEY AUTOINCREMENT,
+            nama_mapel TEXT NOT NULL
+        )
+    """)
+
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS nilai (
+            nis TEXT,
+            id_mapel INTEGER,
+            semester INTEGER,
+            nilai REAL,
+            PRIMARY KEY (nis, id_mapel, semester),
+            FOREIGN KEY (nis) REFERENCES siswa (nis),
+            FOREIGN KEY (id_mapel) REFERENCES mata_pelajaran (id_mapel)
+        )
+    """)
+
+  # Cek jika data siswa masih kosong, masukkan sampel dummy
+  cursor.execute("SELECT COUNT(*) FROM siswa")
+  if cursor.fetchone()[0] == 0:
+    cursor.execute("INSERT INTO kelas (id_kelas, nama_kelas) VALUES (1, 'XII KGSP 1')")
+    cursor.execute(
+        "INSERT INTO siswa (nis, nisn, nama_siswa, jenis_kelamin, ttl, id_kelas) VALUES "
+        "('12345', '0051234567', 'Budi Santoso', 'Laki-laki', 'Jakarta, 12 Januari 2005', 1)"
+    )
+    cursor.execute("INSERT INTO mata_pelajaran (id_mapel, nama_mapel) VALUES (1, 'Mekanika Teknik'), (2, 'Gambar Teknik')")
+    cursor.execute(
+        "INSERT INTO nilai (nis, id_mapel, semester, nilai) VALUES "
+        "('12345', 1, 1, 85.0), ('12345', 1, 2, 88.0), ('12345', 2, 1, 90.0)"
+    )
+
+  conn.commit()
+  conn.close()
+
+
+init_db()
 
 
 def execute_query(query, params=None):
-  conn = mysql.connector.connect(**DB_CONFIG)
-  cursor = conn.cursor(dictionary=True)
+  conn = sqlite3.connect(DB_NAME)
+  conn.row_factory = sqlite3.Row
+  cursor = conn.cursor()
   cursor.execute(query, params or ())
-  result = cursor.fetchall()
+  result = [dict(row) for row in cursor.fetchall()]
   conn.close()
   return result
 
 
 def execute_commit(query, params=None):
-  conn = mysql.connector.connect(**DB_CONFIG)
+  conn = sqlite3.connect(DB_NAME)
   cursor = conn.cursor()
   cursor.execute(query, params or ())
   conn.commit()
@@ -63,7 +117,7 @@ def execute_commit(query, params=None):
 
 
 # ==============================================================================
-# 2. LOAD DATA DARI MYSQL & FUNGSI GENERATE PDF
+# 2. LOAD DATA DARI SQLITE & FUNGSI GENERATE PDF
 # ==============================================================================
 @st.cache_data(ttl=300)
 def load_full_data():
@@ -321,10 +375,7 @@ def generate_pdf_transkrip(info_siswa, df_siswa):
 try:
   df_raw = load_full_data()
 except Exception as e:
-  st.error(
-      f"❌ Gagal terhubung ke database MySQL. Pastikan XAMPP (Apache & MySQL)"
-      f" aktif! Error: {e}"
-  )
+  st.error(f"❌ Gagal membaca data dari database SQLite. Error: {e}")
   st.stop()
 
 
@@ -356,7 +407,6 @@ if not st.session_state.logged_in:
       submit_login = st.form_submit_button("Masuk ke Sistem", use_container_width=True)
 
       if submit_login:
-        # 1. Cek Admin / Guru
         if username_input == "admin" and password_input == "admin123":
           st.session_state.logged_in = True
           st.session_state.user_role = "admin"
@@ -364,9 +414,8 @@ if not st.session_state.logged_in:
           st.success("Berhasil login sebagai Administrator!")
           st.rerun()
 
-        # 2. Cek Siswa (Username = NIS & Password = 'siswa_smkn26jkt')
         elif password_input == "siswa_smkn26jkt":
-          cek_siswa = df_raw[df_raw["nis"] == username_input]
+          cek_siswa = df_raw[df_raw["nis"] == username_input] if not df_raw.empty else pd.DataFrame()
           if not cek_siswa.empty:
             st.session_state.logged_in = True
             st.session_state.user_role = "siswa"
@@ -405,7 +454,6 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
 
 st.sidebar.markdown("---")
 
-# Batasi menu navigasi untuk siswa
 if st.session_state.user_role == "siswa":
   menu = st.sidebar.radio("📌 Navigasi:", ["📜 Transkrip / Rapor Saya"])
 else:
@@ -421,7 +469,7 @@ else:
 
 
 # ==============================================================================
-# 5. FUNGSI RENDER DETAIL SISWA (TABEL & ALL GRAFIK)
+# 5. FUNGSI RENDER DETAIL SISWA
 # ==============================================================================
 def render_detail_siswa(info, df_siswa):
   m1, m2, m3 = st.columns(3)
@@ -474,7 +522,6 @@ def render_detail_siswa(info, df_siswa):
 
   st.markdown("---")
 
-  # --- GRAFIK 1: TREN RATA-RATA KESELURUHAN PER SEMESTER ---
   st.subheader("📈 Tren Rata-Rata Nilai Per Semester")
   sem_avg = df_siswa.groupby("semester")["nilai"].mean().round(2).reset_index()
   sem_avg.columns = ["Semester", "Rata-Rata Nilai"]
@@ -494,7 +541,6 @@ def render_detail_siswa(info, df_siswa):
 
   st.markdown("---")
 
-  # --- GRAFIK 2: TREN PER MATA PELAJARAN (FITUR PREDIPILIH SPESIFIK) ---
   st.subheader("🎯 Tren Per Mata Pelajaran")
   available_mapel = sorted(df_siswa["nama_mapel"].unique().tolist())
 
@@ -531,14 +577,10 @@ def render_detail_siswa(info, df_siswa):
 # MODUL SISTEM BERDASARKAN HAK AKSES
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# HAK AKSES SISWA: HANYA MELIHAT NILAI MILIK SENDIRI
-# ------------------------------------------------------------------------------
 if st.session_state.user_role == "siswa":
   st.title("📜 Transkrip Nilai Siswa")
 
-  df_siswa = df_raw[df_raw["nis"] == st.session_state.user_nis].copy()
-  df_siswa["nilai"] = pd.to_numeric(df_siswa["nilai"], errors="coerce")
+  df_siswa = df_raw[df_raw["nis"] == st.session_state.user_nis].copy() if not df_raw.empty else pd.DataFrame()
 
   if not df_siswa.empty:
     info = df_siswa.iloc[0]
@@ -568,191 +610,194 @@ if st.session_state.user_role == "siswa":
   else:
     st.warning("⚠️ Data nilai untuk NIS ini belum tersedia di database.")
 
-# ------------------------------------------------------------------------------
-# HAK AKSES ADMIN / GURU (AKSES PENUH)
-# ------------------------------------------------------------------------------
 elif menu == "🏠 Dashboard Utama":
   st.title("🎓 Dashboard Pengolahan Nilai Siswa")
 
-  col1, col2, col3, col4 = st.columns(4)
-  total_siswa = df_raw["nis"].nunique()
-  total_kelas = df_raw["nama_kelas"].nunique()
-  avg_nilai = df_raw["nilai"].mean() if not df_raw.empty else 0.0
-  max_nilai = df_raw["nilai"].max() if not df_raw.empty else 0.0
+  if not df_raw.empty:
+    col1, col2, col3, col4 = st.columns(4)
+    total_siswa = df_raw["nis"].nunique()
+    total_kelas = df_raw["nama_kelas"].nunique()
+    avg_nilai = df_raw["nilai"].mean()
+    max_nilai = df_raw["nilai"].max()
 
-  col1.metric("Total Siswa", f"{total_siswa} Orang")
-  col2.metric("Total Kelas", f"{total_kelas} Kelas")
-  col3.metric("Rata-Rata Nilai", f"{avg_nilai:.2f}")
-  col4.metric("Nilai Tertinggi", f"{max_nilai:.2f}")
+    col1.metric("Total Siswa", f"{total_siswa} Orang")
+    col2.metric("Total Kelas", f"{total_kelas} Kelas")
+    col3.metric("Rata-Rata Nilai", f"{avg_nilai:.2f}")
+    col4.metric("Nilai Tertinggi", f"{max_nilai:.2f}")
 
-  st.markdown("---")
-  col_left, col_right = st.columns(2)
+    st.markdown("---")
+    col_left, col_right = st.columns(2)
 
-  with col_left:
-    st.subheader("📈 Rata-Rata Nilai Per Mata Pelajaran")
-    avg_mapel = (
-        df_raw.groupby("nama_mapel")["nilai"]
-        .mean()
-        .reset_index()
-        .sort_values(by="nilai", ascending=True)
-    )
+    with col_left:
+      st.subheader("📈 Rata-Rata Nilai Per Mata Pelajaran")
+      avg_mapel = (
+          df_raw.groupby("nama_mapel")["nilai"]
+          .mean()
+          .reset_index()
+          .sort_values(by="nilai", ascending=True)
+      )
 
-    fig_mapel = px.bar(
-        avg_mapel,
-        x="nilai",
-        y="nama_mapel",
-        orientation="h",
-        text_auto=".2f",
-        color="nilai",
-        color_continuous_scale="Blues",
-    )
-    fig_mapel.update_layout(showlegend=False, height=500)
-    st.plotly_chart(fig_mapel, use_container_width=True)
+      fig_mapel = px.bar(
+          avg_mapel,
+          x="nilai",
+          y="nama_mapel",
+          orientation="h",
+          text_auto=".2f",
+          color="nilai",
+          color_continuous_scale="Blues",
+      )
+      fig_mapel.update_layout(showlegend=False, height=500)
+      st.plotly_chart(fig_mapel, use_container_width=True)
 
-  with col_right:
-    st.subheader("📊 Distribusi Rentang Nilai")
-    bins = [0, 60, 75, 85, 100]
-    labels = [
-        "Kurang (<60)",
-        "Cukup (60-74)",
-        "Baik (75-85)",
-        "Sangat Baik (86-100)",
-    ]
-    df_raw["kategori"] = pd.cut(df_raw["nilai"], bins=bins, labels=labels)
-    kat_counts = df_raw["kategori"].value_counts().reset_index()
-    kat_counts.columns = ["Kategori", "Jumlah"]
+    with col_right:
+      st.subheader("📊 Distribusi Rentang Nilai")
+      bins = [0, 60, 75, 85, 100]
+      labels = [
+          "Kurang (<60)",
+          "Cukup (60-74)",
+          "Baik (75-85)",
+          "Sangat Baik (86-100)",
+      ]
+      df_raw["kategori"] = pd.cut(df_raw["nilai"], bins=bins, labels=labels)
+      kat_counts = df_raw["kategori"].value_counts().reset_index()
+      kat_counts.columns = ["Kategori", "Jumlah"]
 
-    fig_pie = px.pie(
-        kat_counts,
-        names="Kategori",
-        values="Jumlah",
-        hole=0.4,
-        color_discrete_sequence=px.colors.qualitative.Pastel,
-    )
-    fig_pie.update_layout(height=500)
-    st.plotly_chart(fig_pie, use_container_width=True)
+      fig_pie = px.pie(
+          kat_counts,
+          names="Kategori",
+          values="Jumlah",
+          hole=0.4,
+          color_discrete_sequence=px.colors.qualitative.Pastel,
+      )
+      fig_pie.update_layout(height=500)
+      st.plotly_chart(fig_pie, use_container_width=True)
+  else:
+    st.info("Belum ada data nilai di database.")
 
 elif menu == "📊 Rekap & Analisis Nilai":
   st.title("📊 Tabel Rekap & Analisis Nilai")
 
-  list_kelas = sorted(df_raw["nama_kelas"].dropna().unique().tolist())
-  selected_kelas = st.selectbox("Pilih Kelas:", options=list_kelas)
+  if not df_raw.empty:
+    list_kelas = sorted(df_raw["nama_kelas"].dropna().unique().tolist())
+    selected_kelas = st.selectbox("Pilih Kelas:", options=list_kelas)
 
-  df_filtered = df_raw[df_raw["nama_kelas"] == selected_kelas]
+    df_filtered = df_raw[df_raw["nama_kelas"] == selected_kelas]
 
-  pivot_df = pd.pivot_table(
-      df_filtered,
-      values="nilai",
-      index=["nama_kelas", "nis", "nama_siswa"],
-      columns="nama_mapel",
-      aggfunc="mean",
-  ).reset_index()
+    pivot_df = pd.pivot_table(
+        df_filtered,
+        values="nilai",
+        index=["nama_kelas", "nis", "nama_siswa"],
+        columns="nama_mapel",
+        aggfunc="mean",
+    ).reset_index()
 
-  non_numeric_cols = ["nama_kelas", "nis", "nama_siswa"]
-  mapel_cols = [c for c in pivot_df.columns if c not in non_numeric_cols]
-  pivot_df[mapel_cols] = np.ceil(pivot_df[mapel_cols])
+    non_numeric_cols = ["nama_kelas", "nis", "nama_siswa"]
+    mapel_cols = [c for c in pivot_df.columns if c not in non_numeric_cols]
+    pivot_df[mapel_cols] = np.ceil(pivot_df[mapel_cols])
 
-  st.dataframe(
-      pivot_df.style.highlight_max(axis=0, subset=mapel_cols, color="#d4edda")
-      .highlight_min(axis=0, subset=mapel_cols, color="#f8d7da")
-      .format("{:.0f}", subset=mapel_cols, na_rep="-"),
-      use_container_width=True,
-  )
+    st.dataframe(
+        pivot_df.style.highlight_max(axis=0, subset=mapel_cols, color="#d4edda")
+        .highlight_min(axis=0, subset=mapel_cols, color="#f8d7da")
+        .format("{:.0f}", subset=mapel_cols, na_rep="-"),
+        use_container_width=True,
+    )
 
 elif menu == "📜 Transkrip / Rapor Siswa":
   st.title("📜 Transkrip & Lembar Rapor Siswa")
 
-  siswa_options = (
-      df_raw[["nis", "nama_siswa", "nama_kelas"]]
-      .drop_duplicates()
-      .sort_values(by="nama_siswa")
-  )
-  siswa_list = [
-      f"{row['nis']} - {row['nama_siswa']} ({row['nama_kelas']})"
-      for _, row in siswa_options.iterrows()
-  ]
+  if not df_raw.empty:
+    siswa_options = (
+        df_raw[["nis", "nama_siswa", "nama_kelas"]]
+        .drop_duplicates()
+        .sort_values(by="nama_siswa")
+    )
+    siswa_list = [
+        f"{row['nis']} - {row['nama_siswa']} ({row['nama_kelas']})"
+        for _, row in siswa_options.iterrows()
+    ]
 
-  selected_siswa_str = st.selectbox("Cari / Pilih Siswa:", options=siswa_list)
+    selected_siswa_str = st.selectbox("Cari / Pilih Siswa:", options=siswa_list)
 
-  if selected_siswa_str:
-    nis_selected = selected_siswa_str.split(" - ")[0]
-    df_siswa = df_raw[df_raw["nis"] == nis_selected].copy()
-    df_siswa["nilai"] = pd.to_numeric(df_siswa["nilai"], errors="coerce")
+    if selected_siswa_str:
+      nis_selected = selected_siswa_str.split(" - ")[0]
+      df_siswa = df_raw[df_raw["nis"] == nis_selected].copy()
 
-    if not df_siswa.empty:
-      info = df_siswa.iloc[0]
+      if not df_siswa.empty:
+        info = df_siswa.iloc[0]
 
-      st.markdown("---")
-      col_info, col_pdf = st.columns([3, 1])
+        st.markdown("---")
+        col_info, col_pdf = st.columns([3, 1])
 
-      with col_info:
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(f"**NIS / NISN:** {info['nis']} / {info['nisn']}")
-        c2.markdown(f"**Nama Lengkap:** {info['nama_siswa']}")
-        c3.markdown(f"**Kelas:** {info['nama_kelas']}")
+        with col_info:
+          c1, c2, c3 = st.columns(3)
+          c1.markdown(f"**NIS / NISN:** {info['nis']} / {info['nisn']}")
+          c2.markdown(f"**Nama Lengkap:** {info['nama_siswa']}")
+          c3.markdown(f"**Kelas:** {info['nama_kelas']}")
 
-      with col_pdf:
-        pdf_bytes = generate_pdf_transkrip(info, df_siswa)
-        st.download_button(
-            label="🖨️ Cetak Transkrip PDF",
-            data=pdf_bytes,
-            file_name=f"Transkrip_{info['nis']}_{info['nama_siswa'].replace(' ', '_')}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
+        with col_pdf:
+          pdf_bytes = generate_pdf_transkrip(info, df_siswa)
+          st.download_button(
+              label="🖨️ Cetak Transkrip PDF",
+              data=pdf_bytes,
+              file_name=f"Transkrip_{info['nis']}_{info['nama_siswa'].replace(' ', '_')}.pdf",
+              mime="application/pdf",
+              use_container_width=True,
+          )
 
-      st.markdown("---")
-      render_detail_siswa(info, df_siswa)
+        st.markdown("---")
+        render_detail_siswa(info, df_siswa)
 
 elif menu == "✏️ Input & Update Nilai":
   st.title("✏️ Pengelolaan & Editor Nilai Siswa")
 
-  list_siswa_edit = (
-      df_raw[["nis", "nama_siswa"]].drop_duplicates().sort_values("nama_siswa")
-  )
-  siswa_dict = dict(
-      zip(list_siswa_edit["nama_siswa"], list_siswa_edit["nis"])
-  )
-
-  selected_nama = st.selectbox(
-      "Pilih Siswa yang Akan Diupdate:", options=list(siswa_dict.keys())
-  )
-  selected_nis = siswa_dict[selected_nama]
-
-  col_m1, col_m2 = st.columns(2)
-  with col_m1:
-    mapel_list = sorted(df_raw["nama_mapel"].unique().tolist())
-    mapel_edit = st.selectbox("Pilih Mata Pelajaran:", options=mapel_list)
-
-  with col_m2:
-    sem_list = sorted(df_raw["semester"].unique().tolist())
-    sem_edit = st.selectbox("Pilih Semester:", options=sem_list)
-
-  with st.form("form_update_nilai"):
-    new_nilai = st.number_input(
-        "Masukkan Nilai Baru (0-100):",
-        min_value=0.0,
-        max_value=100.0,
-        value=80.0,
-        step=0.5,
+  if not df_raw.empty:
+    list_siswa_edit = (
+        df_raw[["nis", "nama_siswa"]].drop_duplicates().sort_values("nama_siswa")
     )
-    submitted = st.form_submit_button("💾 Simpan Perubahan ke MySQL")
+    siswa_dict = dict(
+        zip(list_siswa_edit["nama_siswa"], list_siswa_edit["nis"])
+    )
 
-    if submitted:
-      res_mapel = execute_query(
-          "SELECT id_mapel FROM mata_pelajaran WHERE nama_mapel = %s",
-          (mapel_edit,),
+    selected_nama = st.selectbox(
+        "Pilih Siswa yang Akan Diupdate:", options=list(siswa_dict.keys())
+    )
+    selected_nis = siswa_dict[selected_nama]
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+      mapel_list = sorted(df_raw["nama_mapel"].unique().tolist())
+      mapel_edit = st.selectbox("Pilih Mata Pelajaran:", options=mapel_list)
+
+    with col_m2:
+      sem_list = sorted(df_raw["semester"].unique().tolist())
+      sem_edit = st.selectbox("Pilih Semester:", options=sem_list)
+
+    with st.form("form_update_nilai"):
+      new_nilai = st.number_input(
+          "Masukkan Nilai Baru (0-100):",
+          min_value=0.0,
+          max_value=100.0,
+          value=80.0,
+          step=0.5,
       )
-      if res_mapel:
-        id_mapel = res_mapel[0]["id_mapel"]
-        execute_commit(
-            """
-            INSERT INTO nilai (nis, id_mapel, semester, nilai)
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE nilai = VALUES(nilai)
-            """,
-            (selected_nis, id_mapel, sem_edit, new_nilai),
+      submitted = st.form_submit_button("💾 Simpan Perubahan ke Database")
+
+      if submitted:
+        res_mapel = execute_query(
+            "SELECT id_mapel FROM mata_pelajaran WHERE nama_mapel = ?",
+            (mapel_edit,),
         )
-        st.success("✅ Nilai berhasil diperbarui!")
-        st.cache_data.clear()
-        st.rerun()
+        if res_mapel:
+          id_mapel = res_mapel[0]["id_mapel"]
+          execute_commit(
+              """
+              INSERT INTO nilai (nis, id_mapel, semester, nilai)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(nis, id_mapel, semester) 
+              DO UPDATE SET nilai = excluded.nilai
+              """,
+              (selected_nis, id_mapel, sem_edit, new_nilai),
+          )
+          st.success("✅ Nilai berhasil diperbarui!")
+          st.cache_data.clear()
+          st.rerun()
