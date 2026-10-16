@@ -31,7 +31,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_NAME = "data_nilai.db"
+DB_NAME = "db_nilai_siswa.db"
 
 
 def init_db():
